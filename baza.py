@@ -3,16 +3,20 @@ import sqlite3
 import pandas as pd
 
 # --- KONFIGURACJA BAZY DANYCH ---
+def get_connection():
+    # check_same_thread=False jest kluczowe dla Streamlit
+    return sqlite3.connect('magazyn.db', check_same_thread=False)
+
 def init_db():
-    conn = sqlite3.connect('magazyn.db', check_same_thread=False)
+    conn = get_connection()
     c = conn.cursor()
-    # Tabela Kategorie: id, nazwa, opis
+    # Tabela Kategorie
     c.execute('''CREATE TABLE IF NOT EXISTS kategorie
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   nazwa TEXT NOT NULL,
                   opis TEXT)''')
-   
-    # Tabela Produkty: id, nazwa, liczba, cena, kategoria_id
+    
+    # Tabela Produkty
     c.execute('''CREATE TABLE IF NOT EXISTS produkty
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   nazwa TEXT NOT NULL,
@@ -21,88 +25,139 @@ def init_db():
                   kategoria_id INTEGER,
                   FOREIGN KEY(kategoria_id) REFERENCES kategorie(id))''')
     conn.commit()
-    return conn
+    conn.close()
 
-conn = init_db()
-cursor = conn.cursor()
+init_db()
 
 # --- INTERFEJS STREAMLIT ---
-st.set_page_config(page_title="Zarządzanie Magazynem", layout="wide")
-st.title("📦 System Zarządzania Produktami")
+st.set_page_config(page_title="Magazyn PRO", layout="wide", page_icon="📦")
 
-menu = ["Podgląd Danych", "Dodaj Kategorię", "Dodaj Produkt", "Usuń Element"]
-choice = st.sidebar.selectbox("Menu Operacji", menu)
+# Sidebar - nawigacja
+st.sidebar.title("🎮 Panel Sterowania")
+menu = ["📊 Dashboard", "🔍 Przeglądaj i Szukaj", "➕ Dodaj Dane", "✏️ Edytuj / Usuń"]
+choice = st.sidebar.radio("Wybierz akcję", menu)
 
-# --- 1. PODGLĄD DANYCH ---
-if choice == "Podgląd Danych":
-    st.header("Aktualny stan magazynu")
-   
+conn = get_connection()
+cursor = conn.cursor()
+
+# --- 1. DASHBOARD (STATYSTYKI) ---
+if choice == "📊 Dashboard":
+    st.title("📈 Statystyki Magazynu")
+    
+    # Pobranie danych
+    df_prod = pd.read_sql_query("SELECT * FROM produkty", conn)
+    df_kat = pd.read_sql_query("SELECT * FROM kategorie", conn)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Liczba produktów", len(df_prod))
+    with col2:
+        total_val = (df_prod['liczba'] * df_prod['cena']).sum()
+        st.metric("Wartość magazynu", f"{total_val:,.2f} zł")
+    with col3:
+        st.metric("Liczba kategorii", len(df_kat))
+
+    st.divider()
+    if not df_prod.empty:
+        st.subheader("Podsumowanie ilościowe")
+        st.bar_chart(df_prod.set_index('nazwa')['liczba'])
+
+# --- 2. PRZEGLĄDAJ I SZUKAJ ---
+elif choice == "🔍 Przeglądaj i Szukaj":
+    st.header("🧐 Przeglądanie bazy danych")
+    
+    search_term = st.text_input("Szukaj produktu po nazwie...")
+    
     query = '''
-        SELECT p.id, p.nazwa, p.liczba, p.cena, k.nazwa as kategoria
+        SELECT p.id, p.nazwa, p.liczba, p.cena, k.nazwa as kategoria, (p.liczba * p.cena) as wartosc
         FROM produkty p
         LEFT JOIN kategorie k ON p.kategoria_id = k.id
     '''
     df = pd.read_sql_query(query, conn)
+    
+    if search_term:
+        df = df[df['nazwa'].str.contains(search_term, case=False)]
+    
     st.dataframe(df, use_container_width=True)
+    
+    # Eksport danych
+    csv = df.to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Pobierz raport CSV", csv, "magazyn_raport.csv", "text/csv")
 
-# --- 2. DODAJ KATEGORIĘ ---
-elif choice == "Dodaj Kategorię":
-    st.header("Dodawanie nowej kategorii")
-    with st.form("form_kat"):
-        nazwa = st.text_input("Nazwa kategorii")
-        opis = st.text_area("Opis")
-        submit = st.form_submit_button("Zapisz kategorię")
-       
-        if submit and nazwa:
-            cursor.execute("INSERT INTO kategorie (nazwa, opis) VALUES (?, ?)", (nazwa, opis))
-            conn.commit()
-            st.success(f"Dodano kategorię: {nazwa}")
-
-# --- 3. DODAJ PRODUKT ---
-elif choice == "Dodaj Produkt":
-    st.header("Dodawanie nowego produktu")
-   
-    # Pobranie list kategorii do selectboxa
-    kategorie = cursor.execute("SELECT id, nazwa FROM kategorie").fetchall()
-    kat_options = {k[1]: k[0] for k in kategorie}
-
-    if not kat_options:
-        st.warning("Najpierw dodaj przynajmniej jedną kategorię!")
-    else:
-        with st.form("form_prod"):
-            nazwa = st.text_input("Nazwa produktu")
-            liczba = st.number_input("Liczba (szt.)", min_value=0, step=1)
-            cena = st.number_input("Cena", min_value=0.0, format="%.2f")
-            kat_name = st.selectbox("Kategoria", list(kat_options.keys()))
-            submit = st.form_submit_button("Zapisz produkt")
-           
-            if submit and nazwa:
-                cursor.execute("INSERT INTO produkty (nazwa, liczba, cena, kategoria_id) VALUES (?, ?, ?, ?)",
-                               (nazwa, liczba, cena, kat_options[kat_name]))
-                conn.commit()
-                st.success(f"Dodano produkt: {nazwa}")
-
-# --- 4. USUŃ ELEMENT ---
-elif choice == "Usuń Element":
-    st.header("Usuwanie z bazy danych")
-    tab1, tab2 = st.tabs(["Usuń Produkt", "Usuń Kategorię"])
-   
+# --- 3. DODAJ DANE ---
+elif choice == "➕ Dodaj Dane":
+    tab1, tab2 = st.tabs(["Nowy Produkt", "Nowa Kategoria"])
+    
     with tab1:
-        prods = cursor.execute("SELECT id, nazwa FROM produkty").fetchall()
-        prod_to_del = st.selectbox("Wybierz produkt", prods, format_func=lambda x: x[1])
-        if st.button("Usuń wybrany produkt"):
-            cursor.execute("DELETE FROM produkty WHERE id = ?", (prod_to_del[0],))
-            conn.commit()
-            st.warning(f"Usunięto produkt: {prod_to_del[1]}")
-            st.rerun()
+        st.subheader("Dodaj produkt")
+        kategorie = cursor.execute("SELECT id, nazwa FROM kategorie").fetchall()
+        kat_options = {k[1]: k[0] for k in kategorie}
+        
+        if not kat_options:
+            st.error("Błąd: Najpierw musisz dodać kategorię!")
+        else:
+            with st.form("form_add_prod"):
+                n = st.text_input("Nazwa produktu")
+                l = st.number_input("Ilość", min_value=0)
+                c = st.number_input("Cena", min_value=0.0)
+                k = st.selectbox("Kategoria", list(kat_options.keys()))
+                if st.form_submit_button("Dodaj"):
+                    cursor.execute("INSERT INTO produkty (nazwa, liczba, cena, kategoria_id) VALUES (?,?,?,?)",
+                                   (n, l, c, kat_options[k]))
+                    conn.commit()
+                    st.success("Produkt dodany!")
 
     with tab2:
-        kats = cursor.execute("SELECT id, nazwa FROM kategorie").fetchall()
-        kat_to_del = st.selectbox("Wybierz kategorię", kats, format_func=lambda x: x[1])
-        st.error("Uwaga: Usunięcie kategorii może pozostawić produkty bez przypisania!")
-        if st.button("Usuń wybraną kategorię"):
-            cursor.execute("DELETE FROM kategorie WHERE id = ?", (kat_to_del[0],))
+        st.subheader("Dodaj kategorię")
+        with st.form("form_add_kat"):
+            n_kat = st.text_input("Nazwa kategorii")
+            o_kat = st.text_area("Opis")
+            if st.form_submit_button("Dodaj"):
+                cursor.execute("INSERT INTO kategorie (nazwa, opis) VALUES (?,?)", (n_kat, o_kat))
+                conn.commit()
+                st.success("Kategoria dodana!")
+                st.rerun()
+
+# --- 4. EDYTUJ / USUŃ ---
+elif choice == "✏️ Edytuj / Usuń":
+    st.header("Zarządzanie rekordami")
+    
+    edit_mode = st.toggle("Tryb Edycji", value=False)
+    
+    # Produkty
+    st.subheader("Produkty")
+    prods = cursor.execute("SELECT id, nazwa, liczba, cena FROM produkty").fetchall()
+    for p_id, p_nazwa, p_liczba, p_cena in prods:
+        cols = st.columns([3, 1, 1, 1, 1])
+        cols[0].write(p_nazwa)
+        
+        if edit_mode:
+            new_qty = cols[1].number_input("Ilość", value=p_liczba, key=f"q_{p_id}", label_visibility="collapsed")
+            if cols[3].button("Zapisz", key=f"s_{p_id}"):
+                cursor.execute("UPDATE produkty SET liczba = ? WHERE id = ?", (new_qty, p_id))
+                conn.commit()
+                st.rerun()
+        else:
+            cols[1].write(f"{p_liczba} szt.")
+            cols[2].write(f"{p_cena} zł")
+            
+        if cols[4].button("Usuń", key=f"d_{p_id}"):
+            cursor.execute("DELETE FROM produkty WHERE id = ?", (p_id,))
             conn.commit()
-            st.warning(f"Usunięto kategorię: {kat_to_del[1]}")
             st.rerun()
+
+    st.divider()
+    # Kategorie
+    st.subheader("Kategorie")
+    kats = cursor.execute("SELECT id, nazwa FROM kategorie").fetchall()
+    for k_id, k_nazwa in kats:
+        c1, c2 = st.columns([4, 1])
+        c1.write(k_nazwa)
+        if c2.button("Usuń", key=f"dk_{k_id}"):
+            # Proste zabezpieczenie przed osieroceniem produktów
+            cursor.execute("DELETE FROM kategorie WHERE id = ?", (k_id,))
+            conn.commit()
+            st.rerun()
+
+conn.close()
 
