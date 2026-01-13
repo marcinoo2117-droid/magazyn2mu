@@ -1,81 +1,83 @@
-
 import streamlit as st
-from supabase import create_client, Client
+from supabase import create_client
 
-# Konfiguracja połączenia z Supabase
-# Na Streamlit Cloud dodaj te dane w Settings -> Secrets
-url = st.secrets["SUPABASE_URL"]
-key = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(url, key)
+# 1. Połączenie z bazą
+@st.cache_resource
+def init_connection():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-st.title("📦 Zarządzanie Magazynem")
+supabase = init_connection()
 
-# --- ZAKŁADKI ---
-tab1, tab2 = st.tabs(["Produkty", "Kategorie"])
+st.set_page_config(page_title="Zarządzanie Bazą", layout="wide")
+st.title("📊 Obsługa Bazy Produktów i Kategorii")
 
-# --- OBSŁUGA KATEGORII ---
-with tab2:
-    st.header("Zarządzanie Kategoriami")
-    
-    # Dodawanie kategorii
-    with st.form("add_category"):
-        nazwa_kat = st.text_input("Nazwa kategorii")
-        opis_kat = st.text_area("Opis")
-        submit_kat = st.form_submit_button("Dodaj kategorię")
-        
-        if submit_kat and nazwa_kat:
-            data = {"nazwa": nazwa_kat, "opis": opis_kat}
-            response = supabase.table("kategoria").insert(data).execute()
-            st.success(f"Dodano kategorię: {nazwa_kat}")
+# --- FUNKCJE POMOCNICZE ---
+def get_categories():
+    res = supabase.table("kategoria").select("*").execute()
+    return res.data
 
-    # Usuwanie kategorii
+def get_products():
+    # Pobieramy produkty wraz z nazwą kategorii (join)
+    res = supabase.table("produkty").select("*, kategoria(nazwa)").execute()
+    return res.data
+
+# --- SEKCA 1: KATEGORIE ---
+st.header("📂 Kategorie")
+col1, col2 = st.columns(2)
+
+with col1:
+    with st.form("dodaj_kat", clear_on_submit=True):
+        st.subheader("Dodaj kategorię")
+        n_kat = st.text_input("Nazwa kategorii")
+        o_kat = st.text_area("Opis")
+        if st.form_submit_button("Zapisz"):
+            supabase.table("kategoria").insert({"nazwa": n_kat, "opis": o_kat}).execute()
+            st.rerun()
+
+with col2:
     st.subheader("Usuń kategorię")
-    kategorie = supabase.table("kategoria").select("id, nazwa").execute()
-    kat_options = {item['nazwa']: item['id'] for item in kategorie.data}
-    
-    selected_kat_del = st.selectbox("Wybierz kategorię do usunięcia", options=list(kat_options.keys()))
-    if st.button("Usuń wybraną kategorię"):
-        supabase.table("kategoria").delete().eq("id", kat_options[selected_kat_del]).execute()
-        st.warning(f"Usunięto kategorię {selected_kat_del}")
-        st.rerun()
+    kats = get_categories()
+    if kats:
+        kat_to_del = st.selectbox("Wybierz kategorię", kats, format_func=lambda x: x['nazwa'])
+        if st.button("❌ Usuń wybraną"):
+            supabase.table("kategoria").delete().eq("id", kat_to_del['id']).execute()
+            st.rerun()
 
-# --- OBSŁUGA PRODUKTÓW ---
-with tab1:
-    st.header("Zarządzanie Produktami")
-    
-    # Pobranie kategorii do selectboxa
-    kategorie_data = supabase.table("kategoria").select("id, nazwa").execute()
-    kat_map = {item['nazwa']: item['id'] for item in kategorie_data.data}
+st.divider()
 
-    # Formularz dodawania produktu
-    with st.form("add_product"):
-        nazwa_prod = st.text_input("Nazwa produktu")
-        liczba = st.number_input("Liczba (szt.)", min_value=0, step=1)
-        cena = st.number_input("Cena", min_value=0.0, format="%.2f")
-        kategoria_nazwa = st.selectbox("Kategoria", options=list(kat_map.keys()))
+# --- SEKCJA 2: PRODUKTY ---
+st.header("📦 Produkty")
+c1, c2 = st.columns([1, 2])
+
+with c1:
+    with st.form("dodaj_prod", clear_on_submit=True):
+        st.subheader("Nowy produkt")
+        p_nazwa = st.text_input("Nazwa")
+        p_liczba = st.number_input("Liczba", step=1, format="%d")
+        p_cena = st.number_input("Cena", step=0.01)
         
-        submit_prod = st.form_submit_button("Dodaj produkt")
+        # Wybór kategorii z listy (Klucz Obcy)
+        p_kat = st.selectbox("Kategoria", kats, format_func=lambda x: x['nazwa']) if kats else None
         
-        if submit_prod and nazwa_prod:
-            prod_data = {
-                "nazwa": nazwa_prod,
-                "liczba": liczba,
-                "cena": cena,
-                "kategoria_id": kat_map[kategoria_nazwa]
+        if st.form_submit_button("Dodaj produkt") and p_kat:
+            payload = {
+                "nazwa": p_nazwa,
+                "liczba": p_liczba,
+                "cena": p_cena,
+                "kategoria_id": p_kat['id']
             }
-            supabase.table("produkty").insert(prod_data).execute()
-            st.success(f"Dodano produkt: {nazwa_prod}")
+            supabase.table("produkty").insert(payload).execute()
+            st.rerun()
 
-    # Lista i usuwanie produktów
-    st.subheader("Aktualna lista produktów")
-    produkty = supabase.table("produkty").select("id, nazwa, liczba, cena").execute()
-    
-    if produkty.data:
-        for p in produkty.data:
-            col1, col2 = st.columns([4, 1])
-            col1.write(f"**{p['nazwa']}** - {p['liczba']} szt. | {p['cena']} zł")
-            if col2.button("Usuń", key=f"del_{p['id']}"):
-                supabase.table("produkty").delete().eq("id", p['id']).execute()
-                st.rerun()
+with c2:
+    st.subheader("Lista produktów")
+    prods = get_products()
+    if prods:
+        for p in prods:
+            with st.expander(f"{p['nazwa']} ({p['kategoria']['nazwa'] if p['kategoria'] else 'Brak'})"):
+                st.write(f"Cena: {p['cena']} | Ilość: {p['liczba']}")
+                if st.button(f"Usuń {p['nazwa']}", key=f"p_{p['id']}"):
+                    supabase.table("produkty").delete().eq("id", p['id']).execute()
+                    st.rerun()
     else:
-        st.info("Brak produktów w bazie.")
+        st.info("Brak produktów.")
