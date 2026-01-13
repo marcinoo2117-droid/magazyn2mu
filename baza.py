@@ -1,83 +1,107 @@
 import streamlit as st
-from supabase import create_client
+import sqlite3
+import pandas as pd
 
-# 1. Połączenie z bazą
-@st.cache_resource
-def init_connection():
-    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+# --- KONFIGURACJA BAZY DANYCH ---
+def init_db():
+    conn = sqlite3.connect('magazyn.db', check_same_thread=False)
+    c = conn.cursor()
+    # Tabela Kategorie: id, nazwa, opis
+    c.execute('''CREATE TABLE IF NOT EXISTS kategorie
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  nazwa TEXT NOT NULL,
+                  opis TEXT)''')
+   
+    # Tabela Produkty: id, nazwa, liczba, cena, kategoria_id
+    c.execute('''CREATE TABLE IF NOT EXISTS produkty
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  nazwa TEXT NOT NULL,
+                  liczba INTEGER DEFAULT 0,
+                  cena REAL DEFAULT 0.0,
+                  kategoria_id INTEGER,
+                  FOREIGN KEY(kategoria_id) REFERENCES kategorie(id))''')
+    conn.commit()
+    return conn
 
-supabase = init_connection()
+conn = init_db()
+cursor = conn.cursor()
 
-st.set_page_config(page_title="Zarządzanie Bazą", layout="wide")
-st.title("📊 Obsługa Bazy Produktów i Kategorii")
+# --- INTERFEJS STREAMLIT ---
+st.set_page_config(page_title="Zarządzanie Magazynem", layout="wide")
+st.title("📦 System Zarządzania Produktami")
 
-# --- FUNKCJE POMOCNICZE ---
-def get_categories():
-    res = supabase.table("kategoria").select("*").execute()
-    return res.data
+menu = ["Podgląd Danych", "Dodaj Kategorię", "Dodaj Produkt", "Usuń Element"]
+choice = st.sidebar.selectbox("Menu Operacji", menu)
 
-def get_products():
-    # Pobieramy produkty wraz z nazwą kategorii (join)
-    res = supabase.table("produkty").select("*, kategoria(nazwa)").execute()
-    return res.data
+# --- 1. PODGLĄD DANYCH ---
+if choice == "Podgląd Danych":
+    st.header("Aktualny stan magazynu")
+   
+    query = '''
+        SELECT p.id, p.nazwa, p.liczba, p.cena, k.nazwa as kategoria
+        FROM produkty p
+        LEFT JOIN kategorie k ON p.kategoria_id = k.id
+    '''
+    df = pd.read_sql_query(query, conn)
+    st.dataframe(df, use_container_width=True)
 
-# --- SEKCA 1: KATEGORIE ---
-st.header("📂 Kategorie")
-col1, col2 = st.columns(2)
+# --- 2. DODAJ KATEGORIĘ ---
+elif choice == "Dodaj Kategorię":
+    st.header("Dodawanie nowej kategorii")
+    with st.form("form_kat"):
+        nazwa = st.text_input("Nazwa kategorii")
+        opis = st.text_area("Opis")
+        submit = st.form_submit_button("Zapisz kategorię")
+       
+        if submit and nazwa:
+            cursor.execute("INSERT INTO kategorie (nazwa, opis) VALUES (?, ?)", (nazwa, opis))
+            conn.commit()
+            st.success(f"Dodano kategorię: {nazwa}")
 
-with col1:
-    with st.form("dodaj_kat", clear_on_submit=True):
-        st.subheader("Dodaj kategorię")
-        n_kat = st.text_input("Nazwa kategorii")
-        o_kat = st.text_area("Opis")
-        if st.form_submit_button("Zapisz"):
-            supabase.table("kategoria").insert({"nazwa": n_kat, "opis": o_kat}).execute()
-            st.rerun()
+# --- 3. DODAJ PRODUKT ---
+elif choice == "Dodaj Produkt":
+    st.header("Dodawanie nowego produktu")
+   
+    # Pobranie list kategorii do selectboxa
+    kategorie = cursor.execute("SELECT id, nazwa FROM kategorie").fetchall()
+    kat_options = {k[1]: k[0] for k in kategorie}
 
-with col2:
-    st.subheader("Usuń kategorię")
-    kats = get_categories()
-    if kats:
-        kat_to_del = st.selectbox("Wybierz kategorię", kats, format_func=lambda x: x['nazwa'])
-        if st.button("❌ Usuń wybraną"):
-            supabase.table("kategoria").delete().eq("id", kat_to_del['id']).execute()
-            st.rerun()
-
-st.divider()
-
-# --- SEKCJA 2: PRODUKTY ---
-st.header("📦 Produkty")
-c1, c2 = st.columns([1, 2])
-
-with c1:
-    with st.form("dodaj_prod", clear_on_submit=True):
-        st.subheader("Nowy produkt")
-        p_nazwa = st.text_input("Nazwa")
-        p_liczba = st.number_input("Liczba", step=1, format="%d")
-        p_cena = st.number_input("Cena", step=0.01)
-        
-        # Wybór kategorii z listy (Klucz Obcy)
-        p_kat = st.selectbox("Kategoria", kats, format_func=lambda x: x['nazwa']) if kats else None
-        
-        if st.form_submit_button("Dodaj produkt") and p_kat:
-            payload = {
-                "nazwa": p_nazwa,
-                "liczba": p_liczba,
-                "cena": p_cena,
-                "kategoria_id": p_kat['id']
-            }
-            supabase.table("produkty").insert(payload).execute()
-            st.rerun()
-
-with c2:
-    st.subheader("Lista produktów")
-    prods = get_products()
-    if prods:
-        for p in prods:
-            with st.expander(f"{p['nazwa']} ({p['kategoria']['nazwa'] if p['kategoria'] else 'Brak'})"):
-                st.write(f"Cena: {p['cena']} | Ilość: {p['liczba']}")
-                if st.button(f"Usuń {p['nazwa']}", key=f"p_{p['id']}"):
-                    supabase.table("produkty").delete().eq("id", p['id']).execute()
-                    st.rerun()
+    if not kat_options:
+        st.warning("Najpierw dodaj przynajmniej jedną kategorię!")
     else:
-        st.info("Brak produktów.")
+        with st.form("form_prod"):
+            nazwa = st.text_input("Nazwa produktu")
+            liczba = st.number_input("Liczba (szt.)", min_value=0, step=1)
+            cena = st.number_input("Cena", min_value=0.0, format="%.2f")
+            kat_name = st.selectbox("Kategoria", list(kat_options.keys()))
+            submit = st.form_submit_button("Zapisz produkt")
+           
+            if submit and nazwa:
+                cursor.execute("INSERT INTO produkty (nazwa, liczba, cena, kategoria_id) VALUES (?, ?, ?, ?)",
+                               (nazwa, liczba, cena, kat_options[kat_name]))
+                conn.commit()
+                st.success(f"Dodano produkt: {nazwa}")
+
+# --- 4. USUŃ ELEMENT ---
+elif choice == "Usuń Element":
+    st.header("Usuwanie z bazy danych")
+    tab1, tab2 = st.tabs(["Usuń Produkt", "Usuń Kategorię"])
+   
+    with tab1:
+        prods = cursor.execute("SELECT id, nazwa FROM produkty").fetchall()
+        prod_to_del = st.selectbox("Wybierz produkt", prods, format_func=lambda x: x[1])
+        if st.button("Usuń wybrany produkt"):
+            cursor.execute("DELETE FROM produkty WHERE id = ?", (prod_to_del[0],))
+            conn.commit()
+            st.warning(f"Usunięto produkt: {prod_to_del[1]}")
+            st.rerun()
+
+    with tab2:
+        kats = cursor.execute("SELECT id, nazwa FROM kategorie").fetchall()
+        kat_to_del = st.selectbox("Wybierz kategorię", kats, format_func=lambda x: x[1])
+        st.error("Uwaga: Usunięcie kategorii może pozostawić produkty bez przypisania!")
+        if st.button("Usuń wybraną kategorię"):
+            cursor.execute("DELETE FROM kategorie WHERE id = ?", (kat_to_del[0],))
+            conn.commit()
+            st.warning(f"Usunięto kategorię: {kat_to_del[1]}")
+            st.rerun()
