@@ -1,115 +1,82 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
-import os
+from supabase import create_client
 
-# --- KONFIGURACJA BAZY ---
-DB_FILE = "magazyn.db"
+# --- POŁĄCZENIE ---
+@st.cache_resource
+def init_connection():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-def get_connection():
-    """Tworzy bezpieczne połączenie z bazą danych."""
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    # To pozwala na dostęp do kolumn po nazwach jak w słowniku
-    conn.row_factory = sqlite3.Row 
-    return conn
+supabase = init_connection()
 
-def init_db():
-    """Inicjalizacja tabel jeśli nie istnieją."""
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS kategoria
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      nazwa TEXT NOT NULL,
-                      opis TEXT)''')
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS produkty
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      nazwa TEXT NOT NULL,
-                      liczba INTEGER DEFAULT 0,
-                      cena REAL DEFAULT 0.0,
-                      kategoria_id INTEGER,
-                      FOREIGN KEY(kategoria_id) REFERENCES kategoria(id))''')
-        conn.commit()
-
-# Inicjalizacja przy starcie
-init_db()
-
-# --- INTERFEJS ---
-st.set_page_config(page_title="Magazyn", layout="wide")
-
-# Funkcja do pobierania danych (z odświeżaniem)
-def fetch_data(query):
-    with get_connection() as conn:
-        return pd.read_sql_query(query, conn)
-
+st.set_page_config(page_title="Magazyn PRO", layout="wide")
 st.title("📦 System Zarządzania Magazynem")
 
-# Sidebar
 menu = ["Podgląd", "Dodaj Dane", "Usuń"]
 choice = st.sidebar.selectbox("Menu", menu)
 
+# --- 1. PODGLĄD ---
 if choice == "Podgląd":
     st.header("Aktualny stan")
+    # Pobieramy produkty z dołączoną nazwą kategorii (join)
+    response = supabase.table("produkty").select("id, nazwa, liczba, cena, kategoria(nazwa)").execute()
     
-    # Poprawione zapytanie SQL - zczytuje nawet jeśli kategoria nie istnieje (LEFT JOIN)
-    query = '''
-        SELECT p.id, p.nazwa, p.liczba, p.cena, k.nazwa as kategoria_nazwa
-        FROM produkty p
-        LEFT JOIN kategoria k ON p.kategoria_id = k.id
-    '''
-    df = fetch_data(query)
-    
-    if not df.empty:
-        st.dataframe(df, use_container_width=True)
+    if response.data:
+        # Spłaszczanie danych, aby nazwa kategorii była w jednej linii
+        flat_data = []
+        for item in response.data:
+            flat_data.append({
+                "ID": item["id"],
+                "Nazwa": item["nazwa"],
+                "Liczba": item["liczba"],
+                "Cena": item["cena"],
+                "Kategoria": item["kategoria"]["nazwa"] if item["kategoria"] else "Brak"
+            })
+        st.dataframe(pd.DataFrame(flat_data), use_container_width=True)
     else:
-        st.info("Baza jest pusta. Dodaj pierwsze dane w menu bocznym.")
+        st.info("Baza jest pusta.")
 
+# --- 2. DODAJ DANE ---
 elif choice == "Dodaj Dane":
-    col1, col2 = st.columns(2)
+    tab1, tab2 = st.tabs(["Nowy Produkt", "Nowa Kategoria"])
     
-    with col1:
-        st.subheader("Dodaj Kategorię")
+    with tab2:
         with st.form("kat_form"):
-            n_kat = st.text_input("Nazwa")
-            o_kat = st.text_input("Opis")
-            if st.form_submit_button("Zapisz"):
-                with get_connection() as conn:
-                    conn.execute("INSERT INTO kategoria (nazwa, opis) VALUES (?,?)", (n_kat, o_kat))
-                st.success("Dodano!")
+            n_kat = st.text_input("Nazwa kategorii")
+            o_kat = st.text_area("Opis")
+            if st.form_submit_button("Dodaj kategorię"):
+                supabase.table("kategoria").insert({"nazwa": n_kat, "opis": o_kat}).execute()
+                st.success("Dodano kategorię!")
                 st.rerun()
 
-    with col2:
-        st.subheader("Dodaj Produkt")
-        # Zczytujemy kategorie do wyboru
-        kat_df = fetch_data("SELECT * FROM kategoria")
-        if kat_df.empty:
+    with tab1:
+        # Pobranie listy kategorii do wyboru
+        kats = supabase.table("kategoria").select("id, nazwa").execute().data
+        if not kats:
             st.warning("Najpierw dodaj kategorię!")
         else:
+            kat_map = {k["nazwa"]: k["id"] for k in kats}
             with st.form("prod_form"):
                 nazwa = st.text_input("Nazwa produktu")
-                ile = st.number_input("Ilość", min_value=0)
+                liczba = st.number_input("Liczba", min_value=0)
                 cena = st.number_input("Cena", min_value=0.0)
-                # Mapowanie nazwy na ID
-                kat_choice = st.selectbox("Kategoria", kat_df['nazwa'].tolist())
-                kat_id = int(kat_df[kat_df['nazwa'] == kat_choice]['id'].values[0])
-                
-                if st.form_submit_button("Dodaj produkt"):
-                    with get_connection() as conn:
-                        conn.execute("INSERT INTO produkty (nazwa, liczba, cena, kategoria_id) VALUES (?,?,?,?)",
-                                     (nazwa, ile, cena, kat_id))
+                kat_name = st.selectbox("Wybierz kategorię", list(kat_map.keys()))
+                if st.form_submit_button("Zapisz produkt"):
+                    supabase.table("produkty").insert({
+                        "nazwa": nazwa, 
+                        "liczba": liczba, 
+                        "cena": cena, 
+                        "kategoria_id": kat_map[kat_name]
+                    }).execute()
                     st.success("Produkt dodany!")
                     st.rerun()
 
+# --- 3. USUŃ ---
 elif choice == "Usuń":
-    st.header("Usuwanie rekordów")
-    
-    # Usuwanie produktu
-    prod_df = fetch_data("SELECT id, nazwa FROM produkty")
-    if not prod_df.empty:
-        p_to_del = st.selectbox("Wybierz produkt do usunięcia", prod_df['nazwa'].tolist())
-        p_id = int(prod_df[prod_df['nazwa'] == p_to_del]['id'].values[0])
-        if st.button("Usuń Produkt"):
-            with get_connection() as conn:
-                conn.execute("DELETE FROM produkty WHERE id = ?", (p_id,))
+    st.subheader("Usuwanie produktów")
+    prods = supabase.table("produkty").select("id, nazwa").execute().data
+    if prods:
+        p_to_del = st.selectbox("Wybierz produkt", prods, format_func=lambda x: x["nazwa"])
+        if st.button("Usuń trwale"):
+            supabase.table("produkty").delete().eq("id", p_to_del["id"]).execute()
             st.rerun()
-            
